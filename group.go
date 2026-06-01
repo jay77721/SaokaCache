@@ -1,4 +1,4 @@
-package kamacache
+package saokacache
 
 import (
 	"context"
@@ -9,13 +9,18 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/youngyangyang04/KamaCache-Go/singleflight"
 )
 
 var (
 	groupsMu sync.RWMutex
 	groups   = make(map[string]*Group)
 )
+
+// contextKey 自定义 context key 类型，避免与其他包冲突
+type contextKey string
+
+// fromPeerKey 用于标记请求来自其他节点
+const fromPeerKey contextKey = "from_peer"
 
 // ErrKeyRequired 键不能为空错误
 var ErrKeyRequired = errors.New("key is required")
@@ -39,16 +44,47 @@ func (f GetterFunc) Get(ctx context.Context, key string) ([]byte, error) {
 	return f(ctx, key)
 }
 
+// peerAwareGetter 包装 peer 查找 + 原始 getter，作为 CachePolicy 的 loader
+type peerAwareGetter struct {
+	group *Group
+}
+
+// Get 先尝试从远程节点获取，失败则回退到原始 getter
+func (p *peerAwareGetter) Get(ctx context.Context, key string) ([]byte, error) {
+	// 尝试从远程节点获取
+	if p.group.peers != nil {
+		peer, ok, isSelf := p.group.peers.PickPeer(key)
+		if ok && !isSelf {
+			bytes, err := peer.Get(p.group.name, key)
+			if err == nil {
+				atomic.AddInt64(&p.group.stats.peerHits, 1)
+				return bytes, nil
+			}
+			atomic.AddInt64(&p.group.stats.peerMisses, 1)
+			logrus.Warnf("[SaokaCache] 从 peer 获取失败: %v", err)
+		}
+	}
+
+	// 回退到原始 getter（如数据库）
+	bytes, err := p.group.getter.Get(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get data: %w", err)
+	}
+
+	atomic.AddInt64(&p.group.stats.loaderHits, 1)
+	return cloneBytes(bytes), nil
+}
+
 // Group 是一个缓存命名空间
 type Group struct {
 	name       string
 	getter     Getter
-	mainCache  *Cache
+	policy     *CachePolicy   // 缓存策略层（封装存储 + 防穿透/击穿/雪崩）
 	peers      PeerPicker
-	loader     *singleflight.Group
-	expiration time.Duration // 缓存过期时间，0表示永不过期
-	closed     int32         // 原子变量，标记组是否已关闭
-	stats      groupStats    // 统计信息
+	expiration time.Duration  // 缓存过期时间，0表示永不过期
+	closed     int32          // 原子变量，标记组是否已关闭
+	stats      groupStats     // 统计信息
+	syncWG     sync.WaitGroup // 跟踪同步 goroutine
 }
 
 // groupStats 保存组的统计信息
@@ -83,7 +119,8 @@ func WithPeers(peers PeerPicker) GroupOption {
 // WithCacheOptions 设置缓存选项
 func WithCacheOptions(opts CacheOptions) GroupOption {
 	return func(g *Group) {
-		g.mainCache = NewCache(opts)
+		cache := NewCache(opts)
+		g.policy = NewCachePolicy(cache, &peerAwareGetter{group: g}, opts)
 	}
 }
 
@@ -98,11 +135,13 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption)
 	cacheOpts.MaxBytes = cacheBytes
 
 	g := &Group{
-		name:      name,
-		getter:    getter,
-		mainCache: NewCache(cacheOpts),
-		loader:    &singleflight.Group{},
+		name:   name,
+		getter: getter,
 	}
+
+	// 创建缓存策略层（peerAwareGetter 引用 g，所以先创建 g）
+	cache := NewCache(cacheOpts)
+	g.policy = NewCachePolicy(cache, &peerAwareGetter{group: g}, cacheOpts)
 
 	// 应用选项
 	for _, opt := range opts {
@@ -118,7 +157,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption)
 	}
 
 	groups[name] = g
-	logrus.Infof("Created cache group [%s] with cacheBytes=%d, expiration=%v", name, cacheBytes, g.expiration)
+	logrus.Infof("[SaokaCache] 创建缓存组 [%s], cacheBytes=%d, expiration=%v", name, cacheBytes, g.expiration)
 
 	return g
 }
@@ -132,35 +171,35 @@ func GetGroup(name string) *Group {
 
 // Get 从缓存获取数据
 func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
-	// 检查组是否已关闭
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ByteView{}, ErrGroupClosed
 	}
-
 	if key == "" {
 		return ByteView{}, ErrKeyRequired
 	}
 
-	// 从本地缓存获取
-	view, ok := g.mainCache.Get(ctx, key)
-	if ok {
-		atomic.AddInt64(&g.stats.localHits, 1)
-		return view, nil
+	// 通过策略层获取（包含 bloom + store + singleflight + peer + getter）
+	startTime := time.Now()
+	view, err := g.policy.Get(ctx, key)
+	loadDuration := time.Since(startTime).Nanoseconds()
+
+	if err != nil {
+		atomic.AddInt64(&g.stats.localMisses, 1)
+		atomic.AddInt64(&g.stats.loaderErrors, 1)
+		return ByteView{}, err
 	}
 
-	atomic.AddInt64(&g.stats.localMisses, 1)
-
-	// 尝试从其他节点获取或加载
-	return g.load(ctx, key)
+	atomic.AddInt64(&g.stats.localHits, 1)
+	atomic.AddInt64(&g.stats.loads, 1)
+	atomic.AddInt64(&g.stats.loadDuration, loadDuration)
+	return view, nil
 }
 
 // Set 设置缓存值
 func (g *Group) Set(ctx context.Context, key string, value []byte) error {
-	// 检查组是否已关闭
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ErrGroupClosed
 	}
-
 	if key == "" {
 		return ErrKeyRequired
 	}
@@ -168,20 +207,17 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 		return ErrValueRequired
 	}
 
-	// 检查是否是从其他节点同步过来的请求
-	isPeerRequest := ctx.Value("from_peer") != nil
-
-	// 创建缓存视图
+	isPeerRequest := ctx.Value(fromPeerKey) != nil
 	view := ByteView{b: cloneBytes(value)}
 
-	// 设置到本地缓存
+	// 通过策略层写入（带 TTL 抖动）
 	if g.expiration > 0 {
-		g.mainCache.AddWithExpiration(key, view, time.Now().Add(g.expiration))
+		g.policy.SetWithExpiration(key, view, time.Now().Add(g.expiration))
 	} else {
-		g.mainCache.Add(key, view)
+		g.policy.Set(key, view)
 	}
 
-	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
+	// 如果不是 peer 同步请求，且启用了分布式模式，同步到其他节点
 	if !isPeerRequest && g.peers != nil {
 		go g.syncToPeers(ctx, "set", key, value)
 	}
@@ -191,22 +227,16 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 
 // Delete 删除缓存值
 func (g *Group) Delete(ctx context.Context, key string) error {
-	// 检查组是否已关闭
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ErrGroupClosed
 	}
-
 	if key == "" {
 		return ErrKeyRequired
 	}
 
-	// 从本地缓存删除
-	g.mainCache.Delete(key)
+	g.policy.Delete(key)
 
-	// 检查是否是从其他节点同步过来的请求
-	isPeerRequest := ctx.Value("from_peer") != nil
-
-	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
+	isPeerRequest := ctx.Value(fromPeerKey) != nil
 	if !isPeerRequest && g.peers != nil {
 		go g.syncToPeers(ctx, "delete", key, nil)
 	}
@@ -220,124 +250,72 @@ func (g *Group) syncToPeers(ctx context.Context, op string, key string, value []
 		return
 	}
 
-	// 选择对等节点
-	peer, ok, isSelf := g.peers.PickPeer(key)
-	if !ok || isSelf {
+	peers := g.peers.PickAllPeers()
+	if len(peers) == 0 {
 		return
 	}
 
-	// 创建同步请求上下文
-	syncCtx := context.WithValue(context.Background(), "from_peer", true)
+	syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	syncCtx = context.WithValue(syncCtx, fromPeerKey, true)
 
-	var err error
-	switch op {
-	case "set":
-		err = peer.Set(syncCtx, g.name, key, value)
-	case "delete":
-		_, err = peer.Delete(g.name, key)
-	}
+	for _, peer := range peers {
+		g.syncWG.Add(1)
+		go func(p Peer) {
+			defer g.syncWG.Done()
 
-	if err != nil {
-		logrus.Errorf("[KamaCache] failed to sync %s to peer: %v", op, err)
+			var err error
+			switch op {
+			case "set":
+				err = p.Set(syncCtx, g.name, key, value)
+			case "delete":
+				_, err = p.Delete(g.name, key)
+			}
+
+			if err != nil {
+				logrus.Errorf("[SaokaCache] 同步 %s 到 peer 失败: %v", op, err)
+			}
+		}(peer)
 	}
 }
 
 // Clear 清空缓存
 func (g *Group) Clear() {
-	// 检查组是否已关闭
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return
 	}
-
-	g.mainCache.Clear()
-	logrus.Infof("[KamaCache] cleared cache for group [%s]", g.name)
+	g.policy.Clear()
+	logrus.Infof("[SaokaCache] 清空缓存组 [%s]", g.name)
 }
 
 // Close 关闭组并释放资源
 func (g *Group) Close() error {
-	// 如果已经关闭，直接返回
 	if !atomic.CompareAndSwapInt32(&g.closed, 0, 1) {
 		return nil
 	}
 
-	// 关闭本地缓存
-	if g.mainCache != nil {
-		g.mainCache.Close()
+	// 等待所有同步 goroutine 完成（最多 10 秒）
+	done := make(chan struct{})
+	go func() {
+		g.syncWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		logrus.Warnf("[SaokaCache] group [%s] close: sync goroutines timed out", g.name)
 	}
 
-	// 从全局组映射中移除
+	if g.policy != nil {
+		g.policy.Close()
+	}
+
 	groupsMu.Lock()
 	delete(groups, g.name)
 	groupsMu.Unlock()
 
-	logrus.Infof("[KamaCache] closed cache group [%s]", g.name)
+	logrus.Infof("[SaokaCache] 关闭缓存组 [%s]", g.name)
 	return nil
-}
-
-// load 加载数据
-func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
-	// 使用 singleflight 确保并发请求只加载一次
-	startTime := time.Now()
-	viewi, err := g.loader.Do(key, func() (interface{}, error) {
-		return g.loadData(ctx, key)
-	})
-
-	// 记录加载时间
-	loadDuration := time.Since(startTime).Nanoseconds()
-	atomic.AddInt64(&g.stats.loadDuration, loadDuration)
-	atomic.AddInt64(&g.stats.loads, 1)
-
-	if err != nil {
-		atomic.AddInt64(&g.stats.loaderErrors, 1)
-		return ByteView{}, err
-	}
-
-	view := viewi.(ByteView)
-
-	// 设置到本地缓存
-	if g.expiration > 0 {
-		g.mainCache.AddWithExpiration(key, view, time.Now().Add(g.expiration))
-	} else {
-		g.mainCache.Add(key, view)
-	}
-
-	return view, nil
-}
-
-// loadData 实际加载数据的方法
-func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err error) {
-	// 尝试从远程节点获取
-	if g.peers != nil {
-		peer, ok, isSelf := g.peers.PickPeer(key)
-		if ok && !isSelf {
-			value, err := g.getFromPeer(ctx, peer, key)
-			if err == nil {
-				atomic.AddInt64(&g.stats.peerHits, 1)
-				return value, nil
-			}
-
-			atomic.AddInt64(&g.stats.peerMisses, 1)
-			logrus.Warnf("[KamaCache] failed to get from peer: %v", err)
-		}
-	}
-
-	// 从数据源加载
-	bytes, err := g.getter.Get(ctx, key)
-	if err != nil {
-		return ByteView{}, fmt.Errorf("failed to get data: %w", err)
-	}
-
-	atomic.AddInt64(&g.stats.loaderHits, 1)
-	return ByteView{b: cloneBytes(bytes)}, nil
-}
-
-// getFromPeer 从其他节点获取数据
-func (g *Group) getFromPeer(ctx context.Context, peer Peer, key string) (ByteView, error) {
-	bytes, err := peer.Get(g.name, key)
-	if err != nil {
-		return ByteView{}, fmt.Errorf("failed to get from peer: %w", err)
-	}
-	return ByteView{b: bytes}, nil
 }
 
 // RegisterPeers 注册PeerPicker
@@ -346,7 +324,7 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 		panic("RegisterPeers called more than once")
 	}
 	g.peers = peers
-	logrus.Infof("[KamaCache] registered peers for group [%s]", g.name)
+	logrus.Infof("[SaokaCache] 注册 peers 到组 [%s]", g.name)
 }
 
 // Stats 返回缓存统计信息
@@ -364,7 +342,6 @@ func (g *Group) Stats() map[string]interface{} {
 		"loader_errors": atomic.LoadInt64(&g.stats.loaderErrors),
 	}
 
-	// 计算各种命中率
 	totalGets := stats["local_hits"].(int64) + stats["local_misses"].(int64)
 	if totalGets > 0 {
 		stats["hit_rate"] = float64(stats["local_hits"].(int64)) / float64(totalGets)
@@ -375,9 +352,8 @@ func (g *Group) Stats() map[string]interface{} {
 		stats["avg_load_time_ms"] = float64(atomic.LoadInt64(&g.stats.loadDuration)) / float64(totalLoads) / float64(time.Millisecond)
 	}
 
-	// 添加缓存大小
-	if g.mainCache != nil {
-		cacheStats := g.mainCache.Stats()
+	if g.policy != nil {
+		cacheStats := g.policy.Stats()
 		for k, v := range cacheStats {
 			stats["cache_"+k] = v
 		}
@@ -395,7 +371,6 @@ func ListGroups() []string {
 	for name := range groups {
 		names = append(names, name)
 	}
-
 	return names
 }
 
@@ -407,10 +382,9 @@ func DestroyGroup(name string) bool {
 	if g, exists := groups[name]; exists {
 		g.Close()
 		delete(groups, name)
-		logrus.Infof("[KamaCache] destroyed cache group [%s]", name)
+		logrus.Infof("[SaokaCache] 销毁缓存组 [%s]", name)
 		return true
 	}
-
 	return false
 }
 
@@ -422,6 +396,6 @@ func DestroyAllGroups() {
 	for name, g := range groups {
 		g.Close()
 		delete(groups, name)
-		logrus.Infof("[KamaCache] destroyed cache group [%s]", name)
+		logrus.Infof("[SaokaCache] 销毁缓存组 [%s]", name)
 	}
 }

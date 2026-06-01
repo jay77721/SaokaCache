@@ -1,4 +1,4 @@
-package kamacache
+package saokacache
 
 import (
 	"context"
@@ -9,16 +9,17 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/youngyangyang04/KamaCache-Go/consistenthash"
-	"github.com/youngyangyang04/KamaCache-Go/registry"
+	"github.com/youngyangyang04/SaokaCache/consistenthash"
+	"github.com/youngyangyang04/SaokaCache/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-const defaultSvcName = "kama-cache"
+const defaultSvcName = "saoka-cache"
 
 // PeerPicker 定义了peer选择器的接口
 type PeerPicker interface {
 	PickPeer(key string) (peer Peer, ok bool, self bool)
+	PickAllPeers() []Peer // 返回所有非自身的 Peer
 	Close() error
 }
 
@@ -205,6 +206,20 @@ func (p *ClientPicker) PickPeer(key string) (Peer, bool, bool) {
 		}
 	}
 	return nil, false, false
+}
+
+// PickAllPeers 返回所有非自身的 Peer
+func (p *ClientPicker) PickAllPeers() []Peer {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	peers := make([]Peer, 0, len(p.clients))
+	for addr, client := range p.clients {
+		if addr != p.selfAddr {
+			peers = append(peers, client)
+		}
+	}
+	return peers
 }
 
 // Close 关闭所有资源

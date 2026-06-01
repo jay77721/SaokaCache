@@ -1,2 +1,31 @@
+# IDE 配置
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+
+# Go 二进制文件
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试覆盖率文件
+*.out
+coverage.html
+
+# 依赖目录
+vendor/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+tmp/
+temp/

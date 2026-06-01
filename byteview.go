@@ -1,4 +1,4 @@
-package kamacache
+package saokacache
 
 // ByteView 只读的字节视图，用于缓存数据
 type ByteView struct {
@@ -9,7 +9,7 @@ func (b ByteView) Len() int {
 	return len(b.b)
 }
 
-func (b ByteView) ByteSLice() []byte {
+func (b ByteView) ByteSlice() []byte {
 	return cloneBytes(b.b)
 }
 

@@ -35,15 +35,11 @@ func TestCacheBasic(t *testing.T) {
 
 	t.Run("添加和获取", func(t *testing.T) {
 		c := Create(5)
-		var evictCount int
-		onEvicted := func(key string, value Value) {
-			evictCount++
-		}
 
 		// 添加新项
-		status := c.put("key1", testValue("value1"), 100, onEvicted)
-		if status != 1 {
-			t.Fatalf("添加新项应返回1，实际返回%d", status)
+		ev := c.put("key1", testValue("value1"), 100)
+		if ev.key != "" {
+			t.Fatalf("添加新项不应淘汰，实际淘汰了 %s", ev.key)
 		}
 		if c.last != 1 {
 			t.Fatalf("添加一项后last应为1，实际为%d", c.last)
@@ -71,9 +67,9 @@ func TestCacheBasic(t *testing.T) {
 		}
 
 		// 更新现有项
-		status = c.put("key1", testValue("新值"), 200, onEvicted)
-		if status != 0 {
-			t.Fatalf("更新项应返回0，实际返回%d", status)
+		ev = c.put("key1", testValue("新值"), 200)
+		if ev.key != "" {
+			t.Fatalf("更新项不应淘汰，实际淘汰了 %s", ev.key)
 		}
 
 		// 验证更新后的值
@@ -87,7 +83,7 @@ func TestCacheBasic(t *testing.T) {
 		c := Create(5)
 
 		// 添加项
-		c.put("key1", testValue("value1"), 100, nil)
+		c.put("key1", testValue("value1"), 100)
 
 		// 删除存在的项
 		node, status, expireAt := c.del("key1")
@@ -97,8 +93,8 @@ func TestCacheBasic(t *testing.T) {
 		if node == nil {
 			t.Fatal("删除应返回被删除的节点")
 		}
-		if node.expireAt != 0 {
-			t.Fatalf("删除后节点expireAt应为0，实际为%d", node.expireAt)
+		if !node.deleted {
+			t.Fatal("删除后节点deleted应为true")
 		}
 		if expireAt != 100 {
 			t.Fatalf("删除应返回原始expireAt(100)，实际为%d", expireAt)
@@ -109,8 +105,8 @@ func TestCacheBasic(t *testing.T) {
 		if status != 1 {
 			t.Fatal("获取已删除项失败，但键仍应存在于哈希表中")
 		}
-		if node.expireAt != 0 {
-			t.Fatalf("已删除项的expireAt应为0，实际为%d", node.expireAt)
+		if !node.deleted {
+			t.Fatal("已删除项的deleted应为true")
 		}
 
 		// 删除不存在的项
@@ -125,25 +121,16 @@ func TestCacheBasic(t *testing.T) {
 
 	t.Run("容量和淘汰", func(t *testing.T) {
 		c := Create(3) // 容量为3的缓存
-		var evictedKeys []string
-
-		onEvicted := func(key string, value Value) {
-			evictedKeys = append(evictedKeys, key)
-		}
 
 		// 填满缓存
 		for i := 1; i <= 3; i++ {
-			c.put("key"+string(rune('0'+i)), testValue("value"+string(rune('0'+i))), 100, onEvicted)
+			c.put("key"+string(rune('0'+i)), testValue("value"+string(rune('0'+i))), 100)
 		}
 
 		// 再添加一项，应该淘汰最早的key1
-		c.put("key4", testValue("value4"), 100, onEvicted)
-
-		if len(evictedKeys) != 1 {
-			t.Fatalf("应淘汰1项，实际淘汰%d项", len(evictedKeys))
-		}
-		if evictedKeys[0] != "key1" {
-			t.Fatalf("应淘汰key1，实际淘汰%s", evictedKeys[0])
+		ev := c.put("key4", testValue("value4"), 100)
+		if ev.key != "key1" {
+			t.Fatalf("应淘汰key1，实际淘汰 %s", ev.key)
 		}
 
 		// 验证缓存状态
@@ -165,7 +152,7 @@ func TestCacheBasic(t *testing.T) {
 
 		// 按顺序添加3项
 		for i := 1; i <= 3; i++ {
-			c.put("key"+string(rune('0'+i)), testValue("value"+string(rune('0'+i))), 100, nil)
+			c.put("key"+string(rune('0'+i)), testValue("value"+string(rune('0'+i))), 100)
 		}
 
 		// 访问顺序：key1 (最后访问)，key2, key3 (最早访问)
@@ -173,7 +160,7 @@ func TestCacheBasic(t *testing.T) {
 		c.get("key1")
 
 		// 添加新项，应淘汰key3
-		c.put("key4", testValue("value4"), 100, nil)
+		c.put("key4", testValue("value4"), 100)
 
 		// 验证key3被淘汰
 		node, status := c.get("key3")
@@ -198,7 +185,7 @@ func TestCacheBasic(t *testing.T) {
 
 		// 添加3项
 		for i := 1; i <= 3; i++ {
-			c.put("key"+string(rune('0'+i)), testValue("value"+string(rune('0'+i))), 100, nil)
+			c.put("key"+string(rune('0'+i)), testValue("value"+string(rune('0'+i))), 100)
 		}
 
 		// 遍历并收集所有键
@@ -237,31 +224,30 @@ func TestCacheBasic(t *testing.T) {
 
 // 测试缓存容量限制和LRU替换策略
 func TestCacheLRUEviction(t *testing.T) {
-	var evictedKeys []string
-	onEvicted := func(key string, value Value) {
-		evictedKeys = append(evictedKeys, key)
-	}
-
 	// 创建一个容量为3的缓存
 	c := Create(3)
 
 	// 添加3个项，不应该有淘汰
-	c.put("key1", testValue("value1"), Now()+int64(time.Hour), onEvicted)
-	c.put("key2", testValue("value2"), Now()+int64(time.Hour), onEvicted)
-	c.put("key3", testValue("value3"), Now()+int64(time.Hour), onEvicted)
-
-	if len(evictedKeys) != 0 {
-		t.Errorf("Expected no evictions, got %v", evictedKeys)
+	ev := c.put("key1", testValue("value1"), Now()+int64(time.Hour))
+	if ev.key != "" {
+		t.Errorf("Expected no eviction, got %s", ev.key)
+	}
+	ev = c.put("key2", testValue("value2"), Now()+int64(time.Hour))
+	if ev.key != "" {
+		t.Errorf("Expected no eviction, got %s", ev.key)
+	}
+	ev = c.put("key3", testValue("value3"), Now()+int64(time.Hour))
+	if ev.key != "" {
+		t.Errorf("Expected no eviction, got %s", ev.key)
 	}
 
 	// 访问key1使其成为最近使用的
 	c.get("key1")
 
 	// 添加第4个项，应该淘汰最少使用的key2
-	c.put("key4", testValue("value4"), Now()+int64(time.Hour), onEvicted)
-
-	if len(evictedKeys) != 1 || evictedKeys[0] != "key2" {
-		t.Errorf("Expected key2 to be evicted, got %v", evictedKeys)
+	ev = c.put("key4", testValue("value4"), Now()+int64(time.Hour))
+	if ev.key != "key2" {
+		t.Errorf("Expected key2 to be evicted, got %s", ev.key)
 	}
 
 	// 验证key2已被淘汰
@@ -285,9 +271,9 @@ func TestCacheWalk(t *testing.T) {
 	c := Create(5)
 
 	// 添加几个项
-	c.put("key1", testValue("value1"), Now()+int64(time.Hour), nil)
-	c.put("key2", testValue("value2"), Now()+int64(time.Hour), nil)
-	c.put("key3", testValue("value3"), Now()+int64(time.Hour), nil)
+	c.put("key1", testValue("value1"), Now()+int64(time.Hour))
+	c.put("key2", testValue("value2"), Now()+int64(time.Hour))
+	c.put("key3", testValue("value3"), Now()+int64(time.Hour))
 
 	// 删除一个项
 	c.del("key2")
@@ -321,9 +307,9 @@ func TestCacheAdjust(t *testing.T) {
 	c := Create(5)
 
 	// 添加几个项以形成链表
-	c.put("key1", testValue("value1"), Now()+int64(time.Hour), nil)
-	c.put("key2", testValue("value2"), Now()+int64(time.Hour), nil)
-	c.put("key3", testValue("value3"), Now()+int64(time.Hour), nil)
+	c.put("key1", testValue("value1"), Now()+int64(time.Hour))
+	c.put("key2", testValue("value2"), Now()+int64(time.Hour))
+	c.put("key3", testValue("value3"), Now()+int64(time.Hour))
 
 	// 获取key1的索引
 	idx1 := c.hmap["key1"]
@@ -592,7 +578,7 @@ func TestLRU2Store_Get(t *testing.T) {
 
 	// 向一级缓存添加一个项
 	idx := hashBKRD("test-key") & store.mask
-	store.caches[idx][0].put("test-key", testValue("test-value"), Now()+int64(time.Hour), nil)
+	store.caches[idx][0].put("test-key", testValue("test-value"), Now()+int64(time.Hour))
 
 	// 使用_get直接从一级缓存获取
 	node, status := store._get("test-key", idx, 0)
@@ -601,7 +587,7 @@ func TestLRU2Store_Get(t *testing.T) {
 	}
 
 	// 向二级缓存添加一个项
-	store.caches[idx][1].put("test-key2", testValue("test-value2"), Now()+int64(time.Hour), nil)
+	store.caches[idx][1].put("test-key2", testValue("test-value2"), Now()+int64(time.Hour))
 
 	// 使用_get直接从二级缓存获取
 	node, status = store._get("test-key2", idx, 1)
@@ -616,7 +602,7 @@ func TestLRU2Store_Get(t *testing.T) {
 	}
 
 	// 测试过期项
-	store.caches[idx][0].put("expired", testValue("value"), Now()-1000, nil) // 已过期
+	store.caches[idx][0].put("expired", testValue("value"), Now()-1000) // 已过期
 	node, status = store._get("expired", idx, 0)
 	if status != 0 || node != nil {
 		t.Errorf("_get should return status 0 for expired key")
@@ -643,10 +629,10 @@ func TestLRU2StoreDelete(t *testing.T) {
 
 	// 向一级缓存添加一个项
 	idx := hashBKRD("test-key") & store.mask
-	store.caches[idx][0].put("test-key", testValue("test-value"), Now()+int64(time.Hour), nil)
+	store.caches[idx][0].put("test-key", testValue("test-value"), Now()+int64(time.Hour))
 
 	// 向二级缓存添加一个项
-	store.caches[idx][1].put("test-key2", testValue("test-value2"), Now()+int64(time.Hour), nil)
+	store.caches[idx][1].put("test-key2", testValue("test-value2"), Now()+int64(time.Hour))
 
 	// 删除一级缓存中的项
 	deleted := store.delete("test-key", idx)
@@ -790,8 +776,8 @@ func TestLRU2StoreHitRatio(t *testing.T) {
 	// 计算命中率
 	hitRatio := float64(hits) / float64(attempts)
 
-	// 验证命中率大致为0.25-0.35（因为我们添加了50个项但有分桶和LRU淘汰）
-	if hitRatio < 0.25 || hitRatio > 0.35 {
+	// 验证命中率大致为0.45-0.55（50个项存在，50个不存在，淘汰项会晋升到二级缓存）
+	if hitRatio < 0.45 || hitRatio > 0.55 {
 		t.Errorf("Hit ratio out of expected range: got %.2f", hitRatio)
 	}
 }

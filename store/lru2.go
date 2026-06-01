@@ -1,11 +1,14 @@
 package store
 
 import (
-	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// noExpiration 永不过期标记，使用最大 int64 值
+const noExpiration int64 = math.MaxInt64
 
 type lru2Store struct {
 	locks       []sync.Mutex
@@ -60,27 +63,25 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 	// 首先检查一级缓存
 	n1, status1, expireAt := s.caches[idx][0].del(key)
 	if status1 > 0 {
-		// 从一级缓存找到项目
-		if expireAt > 0 && currentTime >= expireAt {
-			// 项目已过期，删除它
-			s.delete(key, idx)
-			fmt.Println("找到项目已过期，删除它")
+		// 从一级缓存找到项目，检查是否过期
+		if expireAt > 0 && expireAt != noExpiration && currentTime >= expireAt {
 			return nil, false
 		}
 
 		// 项目有效，将其移至二级缓存
-		s.caches[idx][1].put(key, n1.v, expireAt, s.onEvicted)
-		fmt.Println("项目有效，将其移至二级缓存")
+		ev := s.caches[idx][1].put(key, n1.v, expireAt)
+		// 如果二级缓存也淘汰了项，触发回调
+		if ev.key != "" && s.onEvicted != nil {
+			s.onEvicted(ev.key, ev.val)
+		}
 		return n1.v, true
 	}
 
 	// 一级缓存未找到，检查二级缓存
 	n2, status2 := s._get(key, idx, 1)
 	if status2 > 0 && n2 != nil {
-		if n2.expireAt > 0 && currentTime >= n2.expireAt {
-			// 项目已过期，删除它
+		if n2.expireAt > 0 && n2.expireAt != noExpiration && currentTime >= n2.expireAt {
 			s.delete(key, idx)
-			fmt.Println("找到项目已过期，删除它")
 			return nil, false
 		}
 
@@ -91,23 +92,31 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 }
 
 func (s *lru2Store) Set(key string, value Value) error {
-	return s.SetWithExpiration(key, value, 9999999999999999)
+	return s.SetWithExpiration(key, value, 0)
 }
 
 func (s *lru2Store) SetWithExpiration(key string, value Value, expiration time.Duration) error {
-	// 计算过期时间 - 确保单位一致
-	expireAt := int64(0)
+	// 计算过期时间：0 表示永不过期
+	expireAt := noExpiration
 	if expiration > 0 {
-		// now() 返回纳秒时间戳，确保 expiration 也是纳秒单位
-		expireAt = Now() + int64(expiration.Nanoseconds())
+		expireAt = Now() + expiration.Nanoseconds()
 	}
 
 	idx := hashBKRD(key) & s.mask
 	s.locks[idx].Lock()
 	defer s.locks[idx].Unlock()
 
-	// 放入一级缓存
-	s.caches[idx][0].put(key, value, expireAt, s.onEvicted)
+	// 放入一级缓存，获取被淘汰的项
+	ev := s.caches[idx][0].put(key, value, expireAt)
+
+	// 将从一级缓存淘汰的项晋升到二级缓存
+	if ev.key != "" && ev.val != nil && ev.expireAt > 0 {
+		ev2 := s.caches[idx][1].put(ev.key, ev.val, ev.expireAt)
+		// 如果二级缓存也淘汰了项，触发回调
+		if ev2.key != "" && s.onEvicted != nil {
+			s.onEvicted(ev2.key, ev2.val)
+		}
+	}
 
 	return nil
 }
@@ -123,34 +132,26 @@ func (s *lru2Store) Delete(key string) bool {
 
 // Clear 实现Store接口
 func (s *lru2Store) Clear() {
-	var keys []string
+	keySet := make(map[string]struct{})
 
 	for i := range s.caches {
 		s.locks[i].Lock()
 
 		s.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
-			keys = append(keys, key)
+			keySet[key] = struct{}{}
 			return true
 		})
 		s.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
-			// 检查键是否已经收集（避免重复）
-			for _, k := range keys {
-				if key == k {
-					return true
-				}
-			}
-			keys = append(keys, key)
+			keySet[key] = struct{}{}
 			return true
 		})
 
 		s.locks[i].Unlock()
 	}
 
-	for _, key := range keys {
+	for key := range keySet {
 		s.Delete(key)
 	}
-
-	//s.expirations = sync.Map{}
 }
 
 // Len 实现Store接口
@@ -227,7 +228,8 @@ func maskOfNextPowOf2(cap uint16) uint16 {
 type node struct {
 	k        string
 	v        Value
-	expireAt int64 // 过期时间戳，expireAt = 0 表示已删除
+	expireAt int64 // 过期时间戳，noExpiration 表示永不过期
+	deleted  bool  // 是否已删除（语义清晰，不复用 expireAt）
 }
 
 // 内部缓存核心实现，包含双向链表和节点存储
@@ -248,25 +250,41 @@ func Create(cap uint16) *cache {
 	}
 }
 
-// 向缓存中添加项，如果是新增返回 1，更新返回 0
-func (c *cache) put(key string, val Value, expireAt int64, onEvicted func(string, Value)) int {
+// evicted 表示被淘汰的缓存项
+type evicted struct {
+	key      string
+	val      Value
+	expireAt int64
+}
+
+// put 向缓存中添加项。
+// 返回被淘汰的项信息（如果有），由调用者决定如何处理淘汰项。
+func (c *cache) put(key string, val Value, expireAt int64) (ev evicted) {
 	if idx, ok := c.hmap[key]; ok {
-		c.m[idx-1].v, c.m[idx-1].expireAt = val, expireAt
+		// 更新已存在的项，重置 deleted 标记
+		c.m[idx-1].v = val
+		c.m[idx-1].expireAt = expireAt
+		c.m[idx-1].deleted = false
 		c.adjust(idx, p, n) // 刷新到链表头部
-		return 0
+		return evicted{}
 	}
 
 	if c.last == uint16(cap(c.m)) {
 		tail := &c.m[c.dlnk[0][p]-1]
-		if onEvicted != nil && (*tail).expireAt > 0 {
-			onEvicted((*tail).k, (*tail).v)
+		// 记录被淘汰的项（未删除的有效项才会被淘汰后晋升）
+		if !(*tail).deleted {
+			ev = evicted{key: (*tail).k, val: (*tail).v, expireAt: (*tail).expireAt}
 		}
 
 		delete(c.hmap, (*tail).k)
-		c.hmap[key], (*tail).k, (*tail).v, (*tail).expireAt = c.dlnk[0][p], key, val, expireAt
+		(*tail).k = key
+		(*tail).v = val
+		(*tail).expireAt = expireAt
+		(*tail).deleted = false
+		c.hmap[key] = c.dlnk[0][p]
 		c.adjust(c.dlnk[0][p], p, n)
 
-		return 1
+		return ev
 	}
 
 	c.last++
@@ -280,11 +298,12 @@ func (c *cache) put(key string, val Value, expireAt int64, onEvicted func(string
 	c.m[c.last-1].k = key
 	c.m[c.last-1].v = val
 	c.m[c.last-1].expireAt = expireAt
+	c.m[c.last-1].deleted = false
 	c.dlnk[c.last] = [2]uint16{0, c.dlnk[0][n]}
 	c.hmap[key] = c.last
 	c.dlnk[0][n] = c.last
 
-	return 1
+	return evicted{}
 }
 
 // 从缓存中获取键对应的节点和状态
@@ -298,10 +317,10 @@ func (c *cache) get(key string) (*node, int) {
 
 // 从缓存中删除键对应的项
 func (c *cache) del(key string) (*node, int, int64) {
-	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt > 0 {
+	if idx, ok := c.hmap[key]; ok && !c.m[idx-1].deleted {
 		e := c.m[idx-1].expireAt
-		c.m[idx-1].expireAt = 0 // 标记为已删除
-		c.adjust(idx, n, p)     // 移动到链表尾部
+		c.m[idx-1].deleted = true // 标记为已删除
+		c.adjust(idx, n, p)       // 移动到链表尾部
 		return &c.m[idx-1], 1, e
 	}
 
@@ -311,7 +330,7 @@ func (c *cache) del(key string) (*node, int, int64) {
 // 遍历缓存中的所有有效项
 func (c *cache) walk(walker func(key string, value Value, expireAt int64) bool) {
 	for idx := c.dlnk[0][n]; idx != 0; idx = c.dlnk[idx][n] {
-		if c.m[idx-1].expireAt > 0 && !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
+		if !c.m[idx-1].deleted && !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
 			return
 		}
 	}
@@ -332,9 +351,16 @@ func (c *cache) adjust(idx, f, t uint16) {
 
 func (s *lru2Store) _get(key string, idx, level int32) (*node, int) {
 	if n, st := s.caches[idx][level].get(key); st > 0 && n != nil {
-		currentTime := Now()
-		if n.expireAt <= 0 || currentTime >= n.expireAt {
-			// 过期或已删除
+		// 已删除的项直接返回未命中
+		if n.deleted {
+			return nil, 0
+		}
+		// 永不过期的项直接返回
+		if n.expireAt == noExpiration {
+			return n, st
+		}
+		// 检查是否过期
+		if n.expireAt <= 0 || Now() >= n.expireAt {
 			return nil, 0
 		}
 		return n, st
@@ -354,10 +380,6 @@ func (s *lru2Store) delete(key string, idx int32) bool {
 		} else if n2 != nil && n2.v != nil {
 			s.onEvicted(key, n2.v)
 		}
-	}
-
-	if deleted {
-		//s.expirations.Delete(key)
 	}
 
 	return deleted

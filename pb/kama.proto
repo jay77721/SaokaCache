@@ -13,12 +13,16 @@ message ResponseForGet {
   bytes value = 1;
 }
 
+message ResponseForSet {
+  bytes value = 1;
+}
+
 message ResponseForDelete {
   bool value = 1;
 }
 
-service KamaCache {
+service SaokaCache {
   rpc Get(Request) returns (ResponseForGet);
-  rpc Set(Request) returns (ResponseForGet);
+  rpc Set(Request) returns (ResponseForSet);
   rpc Delete(Request) returns(ResponseForDelete);
 }

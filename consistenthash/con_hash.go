@@ -21,10 +21,10 @@ type Map struct {
 	hashMap map[int]string
 	// 节点到虚拟节点数量的映射
 	nodeReplicas map[string]int
-	// 节点负载统计
-	nodeCounts map[string]int64
+	// 节点负载统计（使用 sync.Map 避免读锁下的写操作竞态）
+	nodeCounts sync.Map // map[string]*atomic.Int64
 	// 总请求数
-	totalRequests int64
+	totalRequests atomic.Int64
 }
 
 // New 创建一致性哈希实例
@@ -33,7 +33,6 @@ func New(opts ...Option) *Map {
 		config:       DefaultConfig,
 		hashMap:      make(map[int]string),
 		nodeReplicas: make(map[string]int),
-		nodeCounts:   make(map[string]int64),
 	}
 
 	for _, opt := range opts {
@@ -86,6 +85,11 @@ func (m *Map) Remove(node string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	return m.removeNode(node)
+}
+
+// removeNode 内部移除节点方法，调用前必须持有写锁
+func (m *Map) removeNode(node string) error {
 	replicas := m.nodeReplicas[node]
 	if replicas == 0 {
 		return fmt.Errorf("node %s not found", node)
@@ -104,7 +108,7 @@ func (m *Map) Remove(node string) error {
 	}
 
 	delete(m.nodeReplicas, node)
-	delete(m.nodeCounts, node)
+	m.nodeCounts.Delete(node)
 	return nil
 }
 
@@ -133,9 +137,11 @@ func (m *Map) Get(key string) string {
 	}
 
 	node := m.hashMap[m.keys[idx]]
-	count := m.nodeCounts[node]
-	m.nodeCounts[node] = count + 1
-	atomic.AddInt64(&m.totalRequests, 1)
+
+	// 使用 atomic 更新负载统计，避免读锁下的写操作竞态
+	val, _ := m.nodeCounts.LoadOrStore(node, &atomic.Int64{})
+	val.(*atomic.Int64).Add(1)
+	m.totalRequests.Add(1)
 
 	return node
 }
@@ -152,20 +158,29 @@ func (m *Map) addNode(node string, replicas int) {
 
 // checkAndRebalance 检查并重新平衡虚拟节点
 func (m *Map) checkAndRebalance() {
-	if atomic.LoadInt64(&m.totalRequests) < 1000 {
+	total := m.totalRequests.Load()
+	if total < 10000 {
 		return // 样本太少，不进行调整
 	}
 
-	// 计算负载情况
-	avgLoad := float64(m.totalRequests) / float64(len(m.nodeReplicas))
+	// 计算负载情况（需要读锁保护 nodeReplicas）
+	m.mu.RLock()
+	nodeCount := len(m.nodeReplicas)
+	m.mu.RUnlock()
+	if nodeCount == 0 {
+		return
+	}
+	avgLoad := float64(total) / float64(nodeCount)
 	var maxDiff float64
 
-	for _, count := range m.nodeCounts {
+	m.nodeCounts.Range(func(key, value any) bool {
+		count := value.(*atomic.Int64).Load()
 		diff := math.Abs(float64(count) - avgLoad)
 		if diff/avgLoad > maxDiff {
 			maxDiff = diff / avgLoad
 		}
-	}
+		return true
+	})
 
 	// 如果负载不均衡度超过阈值，调整虚拟节点
 	if maxDiff > m.config.LoadBalanceThreshold {
@@ -178,10 +193,17 @@ func (m *Map) rebalanceNodes() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	avgLoad := float64(m.totalRequests) / float64(len(m.nodeReplicas))
+	total := m.totalRequests.Load()
+	nodeCount := len(m.nodeReplicas)
+	if nodeCount == 0 {
+		return
+	}
+	avgLoad := float64(total) / float64(nodeCount)
 
 	// 调整每个节点的虚拟节点数量
-	for node, count := range m.nodeCounts {
+	m.nodeCounts.Range(func(key, value any) bool {
+		node := key.(string)
+		count := value.(*atomic.Int64).Load()
 		currentReplicas := m.nodeReplicas[node]
 		loadRatio := float64(count) / avgLoad
 
@@ -203,19 +225,21 @@ func (m *Map) rebalanceNodes() {
 		}
 
 		if newReplicas != currentReplicas {
-			// 重新添加节点的虚拟节点
-			if err := m.Remove(node); err != nil {
-				continue // 如果移除失败，跳过这个节点
+			// 重新添加节点的虚拟节点（使用 removeNode 避免死锁）
+			if err := m.removeNode(node); err != nil {
+				return true // 如果移除失败，跳过这个节点
 			}
 			m.addNode(node, newReplicas)
 		}
-	}
+		return true
+	})
 
 	// 重置计数器
-	for node := range m.nodeCounts {
-		m.nodeCounts[node] = 0
-	}
-	atomic.StoreInt64(&m.totalRequests, 0)
+	m.nodeCounts.Range(func(key, value any) bool {
+		value.(*atomic.Int64).Store(0)
+		return true
+	})
+	m.totalRequests.Store(0)
 
 	// 重新排序
 	sort.Ints(m.keys)
@@ -227,21 +251,24 @@ func (m *Map) GetStats() map[string]float64 {
 	defer m.mu.RUnlock()
 
 	stats := make(map[string]float64)
-	total := atomic.LoadInt64(&m.totalRequests)
+	total := m.totalRequests.Load()
 	if total == 0 {
 		return stats
 	}
 
-	for node, count := range m.nodeCounts {
+	m.nodeCounts.Range(func(key, value any) bool {
+		node := key.(string)
+		count := value.(*atomic.Int64).Load()
 		stats[node] = float64(count) / float64(total)
-	}
+		return true
+	})
 	return stats
 }
 
 // 将checkAndRebalance移到单独的goroutine中
 func (m *Map) startBalancer() {
 	go func() {
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {

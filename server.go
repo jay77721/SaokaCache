@@ -1,4 +1,4 @@
-package kamacache
+package saokacache
 
 import (
 	"context"
@@ -10,8 +10,8 @@ import (
 	"crypto/tls"
 
 	"github.com/sirupsen/logrus"
-	pb "github.com/youngyangyang04/KamaCache-Go/pb"
-	"github.com/youngyangyang04/KamaCache-Go/registry"
+	pb "github.com/youngyangyang04/SaokaCache/pb"
+	"github.com/youngyangyang04/SaokaCache/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -21,7 +21,7 @@ import (
 
 // Server 定义缓存服务器
 type Server struct {
-	pb.UnimplementedKamaCacheServer
+	pb.UnimplementedSaokaCacheServer
 	addr       string           // 服务地址
 	svcName    string           // 服务名称
 	groups     *sync.Map        // 缓存组
@@ -113,7 +113,7 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 	}
 
 	// 注册服务
-	pb.RegisterKamaCacheServer(srv.grpcServer, srv)
+	pb.RegisterSaokaCacheServer(srv.grpcServer, srv)
 
 	// 注册健康检查服务
 	healthServer := health.NewServer()
@@ -166,27 +166,27 @@ func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 		return nil, err
 	}
 
-	return &pb.ResponseForGet{Value: view.ByteSLice()}, nil
+	return &pb.ResponseForGet{Value: view.ByteSlice()}, nil
 }
 
 // Set 实现Cache服务的Set方法
-func (s *Server) Set(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, error) {
+func (s *Server) Set(ctx context.Context, req *pb.Request) (*pb.ResponseForSet, error) {
 	group := GetGroup(req.Group)
 	if group == nil {
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
 
 	// 从 context 中获取标记，如果没有则创建新的 context
-	fromPeer := ctx.Value("from_peer")
+	fromPeer := ctx.Value(fromPeerKey)
 	if fromPeer == nil {
-		ctx = context.WithValue(ctx, "from_peer", true)
+		ctx = context.WithValue(ctx, fromPeerKey, true)
 	}
 
 	if err := group.Set(ctx, req.Key, req.Value); err != nil {
 		return nil, err
 	}
 
-	return &pb.ResponseForGet{Value: req.Value}, nil
+	return &pb.ResponseForSet{Value: req.Value}, nil
 }
 
 // Delete 实现Cache服务的Delete方法
