@@ -162,3 +162,38 @@ go tool cover -html=coverage.out
 ## 许可证
 
 MIT License
+
+## 贡献（Contributing）
+
+欢迎贡献！推荐的贡献流程：
+
+```bash
+# Fork 仓库并克隆
+git clone git@github.com:<your-username>/SaokaCache.git
+cd SaokaCache
+
+# 创建 feature 分支
+git checkout -b feat/your-feature
+
+# 做出改动并提交
+git add .
+git commit -m "feat: 描述你的改动"
+
+# 推送到你仓库的分支
+git push origin feat/your-feature
+
+# 在 GitHub 上打开 Pull Request，描述变更和测试步骤
+```
+
+如果你直接对上游仓库有写权限，请在提交前确保分支与 `main` 同步并通过所有测试：
+
+```bash
+git fetch origin
+git checkout main
+git pull origin main
+git checkout feat/your-feature
+git rebase main
+go test ./...
+```
+
+感谢你的贡献！
