@@ -2,6 +2,8 @@
 
 分布式内存缓存系统（Go），支持 gRPC 通信、etcd 服务发现、防穿透/击穿/雪崩机制。
 
+> **[English Documentation](README_EN.md)**
+
 ## 架构
 
 ```
