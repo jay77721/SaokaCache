@@ -1,48 +1,48 @@
-# SaokaCache
+﻿# SaokaCache
 
-A distributed in-memory cache system written in Go, featuring gRPC communication, etcd service discovery, and anti-penetration/stampede/avalanche mechanisms.
+A distributed in-memory cache system written in Go, with gRPC communication, etcd service discovery, and triple-layer protection against cache penetration, stampede, and avalanche.
 
-> **[中文文档](README.md)**
+> [中文文档](README.md)
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│              User API (Group)               │
-│         Get / Set / Delete / Stats           │
-└──────────────────┬──────────────────────────┘
-                   ▼
-┌─────────────────────────────────────────────┐
-│          CachePolicy (Policy Layer)          │
-│  ┌───────────┐ ┌────────────┐ ┌──────────┐  │
-│  │   Bloom   │ │singleflight│ │ TTL Jitter│  │
-│  │  Filter   │ │ (Stampede) │ │(Avalanche)│  │
-│  │(Penetrate)│ │            │ │           │  │
-│  └───────────┘ └────────────┘ └──────────┘  │
-└──────────────────┬──────────────────────────┘
-                   ▼
-┌─────────────────────────────────────────────┐
-│           Cache (Pure Storage Layer)         │
-│       lazy init / Get / Set / Stats          │
-└──────────────────┬──────────────────────────┘
-                   ▼
-┌─────────────────────────────────────────────┐
-│              Store Interface                 │
-│  ┌──────────┐       ┌──────────────────┐    │
-│  │   LRU    │       │  LRU2 (Default)  │    │
-│  │ Standard │       │ Two-Level Cache  │    │
-│  └──────────┘       │ Segmented Lock   │    │
-│                     └──────────────────┘    │
-└─────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────┐
-│           Distributed Layer                  │
-│  ┌──────────────┐ ┌─────────┐ ┌──────────┐  │
-│  │peerAwareGetter│ │Consistent│ │  gRPC    │  │
-│  │ peer+getter  │ │  Hash   │ │Server/   │  │
-│  │              │ │ + etcd  │ │Client    │  │
-│  └──────────────┘ └─────────┘ └──────────┘  │
-└─────────────────────────────────────────────┘
+         ┌──────────────────────────────┐
+         │        Group (User API)       │
+         │   Get / Set / Delete / Stats  │
+         └──────────────┬───────────────┘
+                        │
+         ┌──────────────▼───────────────┐
+         │     CachePolicy (Policy)      │
+         │  ┌─────────┬────────┬──────┐ │
+         │  │ Bloom   │ Single │ TTL  │ │
+         │  │ Filter  │ Flight │ Jitter│ │
+         │  │(Penetra)│(Stampe)│(Avala)│ │
+         │  └─────────┴────────┴──────┘ │
+         └──────────────┬───────────────┘
+                        │
+         ┌──────────────▼───────────────┐
+         │      Cache (Storage)         │
+         │    lazy init / Get / Set     │
+         └──────────────┬───────────────┘
+                        │
+         ┌──────────────▼───────────────┐
+         │       Store Interface        │
+         │  ┌────────┐ ┌─────────────┐  │
+         │  │  LRU   │ │ LRU2 (Def)  │  │
+         │  │Standard│ │Two-Level+Seg│  │
+         │  └────────┘ └─────────────┘  │
+         └──────────────────────────────┘
+         ┌──────────────────────────────┐
+         │       Distributed Layer       │
+         │  ┌─────────┬────────┬──────┐ │
+         │  │  Peer   │Consist.│ gRPC │ │
+         │  │Awareness│ Hash   │Comm  │ │
+         │  │+ Getter │+ etcd  │      │ │
+         │  └─────────┴────────┴──────┘ │
+         └──────────────────────────────┘
 ```
 
 ## Key Features
@@ -53,7 +53,7 @@ A distributed in-memory cache system written in Go, featuring gRPC communication
 |---------|---------|----------|
 | **Cache Penetration** | Requests for non-existent keys hit DB | Bloom filter + null value caching |
 | **Cache Stampede** | Hot key expires, concurrent requests flood DB | singleflight request merging |
-| **Cache Avalanche** | Mass key expiration crashes DB | TTL random jitter (±10%) |
+| **Cache Avalanche** | Mass key expiration crashes DB | TTL random jitter (±10%)|
 
 ### Distributed Capabilities
 
@@ -65,7 +65,7 @@ A distributed in-memory cache system written in Go, featuring gRPC communication
 ### Storage Engines
 
 - **LRU** — Standard Least Recently Used eviction
-- **LRU2** — Two-level cache (hot + warm data), segmented locks, high performance
+- **LRU2** (default) — Two-level cache (hot + warm data), segmented locks, high performance
 
 ## Quick Start
 
@@ -76,7 +76,7 @@ go mod download
 # Build
 go build ./...
 
-# Run tests
+# Run tests with race detection
 go test -race ./...
 
 # Run example (3 nodes)
@@ -85,27 +85,62 @@ go run example/test.go -port 8002 -node node2
 go run example/test.go -port 8003 -node node3
 ```
 
-### Using Makefile
+### Makefile
 
 ```bash
-make build    # Build
-make test     # Run tests
-make bench    # Benchmark
-make cover    # Coverage report
-make vet      # Static analysis
+make all       # format -> vet -> test -> build
+make build     # build
+make test      # run tests
+make bench     # benchmarks (store package)
+make cover     # coverage report (generates coverage.html)
+make test-race # race detection
+make fmt       # format code
+make vet       # static analysis
+make lint      # lint (requires golangci-lint)
+make proto     # generate protobuf code
+make deps      # update dependencies
+make clean     # clean build artifacts
+make example   # show example run commands
+make check     # fmt + vet + lint + test
+```
+
+### API Usage
+
+```go
+// Create a cache group (namespace)
+group := saokacache.NewGroup("users", 2<<20,
+    saokacache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+        // Load data on cache miss
+        return fetchFromDatabase(ctx, key)
+    }),
+)
+
+// Attach distributed peer discovery
+picker, _ := saokacache.NewClientPicker(":8001")
+group.RegisterPeers(picker)
+
+// Start gRPC server
+server, _ := saokacache.NewServer(":8001", "saoka-cache",
+    saokacache.WithEtcdEndpoints([]string{"localhost:2379"}),
+)
+
+// Use the cache
+val, err := group.Get(ctx, "user:123")
+group.Set(ctx, "user:456", data, 5*time.Minute)
+group.Delete(ctx, "user:789")
 ```
 
 ## Project Structure
 
 ```
 .
-├── group.go              # User API entry point
+├── group.go              # User API entry point (namespace)
 ├── policy.go             # Policy layer: anti-penetration/stampede/avalanche
 ├── cache.go              # Pure storage layer wrapper
 ├── byteview.go           # Immutable byte view
 ├── server.go             # gRPC server
 ├── client.go             # gRPC client
-├── peers.go              # Consistent hashing + etcd service discovery
+├── peers.go              # Consistent hashing + etcd discovery
 ├── utils.go              # Utility functions
 ├── store/
 │   ├── store.go          # Store interface + factory
@@ -114,11 +149,11 @@ make vet      # Static analysis
 │   └── lru2_test.go      # Unit tests + benchmarks
 ├── bloom/
 │   ├── bloom.go          # Bloom filter
-│   └── bloom_test.go     # Unit tests
+│   └── bloom_test.go
 ├── consistenthash/
 │   ├── config.go         # Configuration
 │   ├── con_hash.go       # Consistent hashing implementation
-│   └── con_hash_test.go  # Unit tests
+│   └── con_hash_test.go
 ├── singleflight/
 │   ├── singleflight.go   # Request merging
 │   └── singleflight_test.go
@@ -135,10 +170,10 @@ make vet      # Static analysis
 ## Testing
 
 ```bash
-# Run all tests with race detection
+# All tests with race detection
 go test -race ./...
 
-# Run specific package tests
+# Specific packages
 go test -v ./store/...
 go test -v ./bloom/...
 go test -v ./consistenthash/...
